@@ -56,7 +56,7 @@ start(Ref, Socket, Transport, Opts) ->
     Timeout = proplists:get_value(timeout, Opts, 5000),
     Time    = calendar:universal_time(),
     Seconds = calendar:datetime_to_gregorian_seconds(Time),
-    ISTag   = httpd_util:integer_to_hexlist(Seconds),
+    ISTag   = etbx:to_binary(httpd_util:integer_to_hexlist(Seconds)),
     loop(Socket, Transport, Timeout, Opts, #state{istag=ISTag}).
 
 %% @private
@@ -64,10 +64,7 @@ loop(Socket, Transport, Timeout, Opts, State) ->
     try
         case Transport:recv(Socket, 0, Timeout) of
             {ok, Incoming} ->
-                io:format("loop state ~p ~n: Incoming: ~p~n", 
-                          [State, Incoming]),
                 NewState = read(Incoming, State),
-                io:format("new state ~p~n", [NewState]),
                 if NewState#state.protocol_state =:= request_complete ->
                         RequestType = NewState#state.request#icap_request.type,
                         respond(Socket, Transport, RequestType, Opts, NewState);
@@ -188,7 +185,7 @@ read_line(Data, State) ->
 %% @private
 decode_uri(<<"icap://", Rest0/binary>>) ->
     case match_char($/, Rest0, <<>>) of
-        {ok, Authority, Rest} -> {Authority, [$/ | Rest]};
+        {ok, Authority, Rest} -> {Authority, [$/ | etbx:to_string(Rest)]};
         {not_found, Rest0}    -> {Rest0, "/"}
     end;
 decode_uri(BadURI) -> throw({bad_request, BadURI}).
@@ -212,17 +209,23 @@ response_code(Type) ->
 %% @private
 respond(Socket, Transport, options, Opts, State) ->
     {_Authority, Path} = decode_uri(State#state.request#icap_request.uri),
-    case lists:keyfind(Path, 1, proplists:get_value(routes, Opts, [])) of
-        false -> send_response(not_found, Socket, Transport);
-        {Path, _, Method} ->
-            Acceptors = proplists:get_value(acceptors, Opts, 1),
-            Date      = httpd_util:rfc1123_date(),
-            Headers   = [{<<"Methods">>, Method},
-                         {<<"ISTag">>,   State#state.istag},
-                         {<<"Date">>,    etbx:to_binary(Date)},
-                         {<<"Max-Connections">>, Acceptors}],
-            send_response(ok, Headers, Socket, Transport);
-        BadRoute -> throw({server_error, BadRoute})
+    case proplists:get_value(routes, Opts) of
+        undefined -> send_response(not_found, Socket, Transport);
+        Routes    ->
+            case lists:keyfind(Path, 1, Routes) of
+                false -> send_response(not_found, Socket, Transport);
+                {Path, _, Method} when is_binary(Method) ->
+                    NumAcceptors = proplists:get_value(acceptors, Opts, 1),
+                    Acceptors    = etbx:to_binary(etbx:to_string(NumAcceptors)),
+                    
+                    Date      = httpd_util:rfc1123_date(),
+                    Headers   = [{<<"Methods">>, Method},
+                                 {<<"ISTag">>,   State#state.istag},
+                                 {<<"Date">>,    etbx:to_binary(Date)},
+                                 {<<"Max-Connections">>, Acceptors}],
+                    send_response(ok, Headers, Socket, Transport);
+                BadRoute -> throw({server_error, BadRoute})
+            end
     end.
             
 %% @private
