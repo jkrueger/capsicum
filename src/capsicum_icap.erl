@@ -27,23 +27,21 @@
 -export([start_link/4]).
 
 -ifdef(TEST).
--export([match_eol/1]).
--export([match_space/1]).
--export([match_any/2]).
+-compile(export_all).
 -endif.
 
--record(icap_request, {uri::binary(),
-                       type=unknown::atom()}).
--type icap_request()::#icap_request{}.
+-include("capsicum.hrl").
 -record(state, {protocol_state=request_wait::atom(),
                 request::icap_request(),
-                headers=[]::[tuple()],
                 istag::binary(),
+                encap_offset::number(),
+                encap_elements::list(),
                 data = <<>>::binary()}).
 
 -define(VERSION, <<"ICAP/1.0">>).
 -define(WS, [$ ,$\r, $\n]).
 -define(CRLF, <<"\r\n">>).
+-define(LS, [$ ,$,]).
 
 %% @doc Called by ranch to spawn off a process to handle this protocol
 start_link(Ref, Socket, Transport, Opts) ->
@@ -117,31 +115,59 @@ match_any(List, Data) ->
     match_any(List, Data, <<>>).
 
 %% @private
+%% search binary for a group containing any of the characters in the list
+match_group_any_remaining(List, <<C, Rest/binary>> = Remaining, Value) ->
+    case etbx:index_of(C, List) of
+        undefined -> {ok, Value, Remaining};
+        _         -> match_group_any_remaining(List, Rest, Value)
+    end;
+match_group_any_remaining(_, <<>>, Value) ->
+    {ok, Value, <<>>}.
+
+match_group_any(List, <<C, Rest/binary>>, Acc) ->
+    case etbx:index_of(C, List) of
+        undefined -> match_group_any(List, Rest, <<Acc/binary, C>>);
+        _         -> match_group_any_remaining(List, Rest, Acc)
+    end;
+match_group_any(_, <<>>, Acc) ->
+    {not_found, Acc}.
+    
+%% @private
+match_group_any(List, Data) ->
+    match_group_any(List, Data, <<>>).
+
+%% @private
 read(Incoming, State) ->
     PrevData = State#state.data,
     Data     = <<Incoming/binary, PrevData/binary>>,
     read_line(Data, State).
 
 %% @private
+read_request(Type, Parameters, State) ->
+    case match_space(Parameters) of
+        {ok, URI, Remaining} ->
+            case match_any(?WS, Remaining) of
+                {ok, ?VERSION, _} -> ok;
+                {ok, V, _}        -> throw({bad_version, V});
+                {not_found, _}    -> throw({bad_request, Remaining})
+            end,
+            IcapRequest = #icap_request{uri=URI, type=Type},
+            State#state{request        = IcapRequest,
+                        protocol_state = headers_wait,
+                        data           = <<>>};
+        {not_found, _} ->
+            throw({bad_request, Parameters})
+    end.
+
+%% @private
 read(request_wait, Request, State) ->
-    case Request of 
-        <<"OPTIONS ", Parameters/binary>> ->
-            case match_space(Parameters) of
-                {ok, URI, Remaining} ->
-                    case match_any(?WS, Remaining) of
-                        {ok, ?VERSION, _} -> ok;
-                        {ok, V, _}        -> throw({bad_version, V});
-                        {not_found, _}    -> throw({bad_request, Remaining})
-                    end,
-                    IcapRequest = #icap_request{uri=URI, type=options},
-                    State#state{request        = IcapRequest,
-                                protocol_state = headers_wait};
-                {not_found, _} ->
-                    throw({bad_request, Parameters})
-            end;
-        _ ->
-            throw({bad_request, Request})
-    end;
+    {Type, Parameters} =  case Request of 
+                              <<"OPTIONS ", Rest/binary>> -> {options,  Rest};
+                              <<"REQMOD ",  Rest/binary>> -> {reqmod,   Rest};
+                              <<"RESPMOD ", Rest/binary>> -> {respmod,  Rest};
+                              _ -> throw({bad_request, Request})
+                          end,
+    read_request(Type, Parameters, State);
 read(headers_wait, Line, State) ->
     case match_space(Line) of 
         {ok, Name0, Rest} ->
@@ -157,29 +183,132 @@ read(headers_wait, Line, State) ->
                             binary:part(Rest, {0, byte_size(Rest) - 1});
                        true -> VLast
                     end,
-            Headers  = [ {Name, Value} | State#state.headers ],
-            State#state{headers=Headers};
+            Request = State#state.request,
+            Headers  = [ {Name, Value} | Request#icap_request.headers ],
+            State#state{request = Request#icap_request{headers=Headers},
+                        data    = <<>>};
         {not_found, Line} ->
             throw({bad_request, Line})
+    end;
+read(prepare_body, Line, State) ->
+    Encap  = header_value(<<"Encapsulated">>, State#state.request),
+    Elements = parse_encap(Encap),
+    [{ProtocolState, _} | _] = Elements,
+    NewState = State#state {encap_offset   = 0,
+                            encap_elements = Elements,
+                            protocol_state = ProtocolState},
+    read(ProtocolState, Line, NewState);
+read(null_body, Line, State) ->
+    read_encap_element(State#state.encap_elements, Line, State);
+read(body_wait, Line, State) ->
+    read_encap_element(State#state.encap_elements, Line, State);
+read(reqhdr_wait, Line, State) ->
+    read_encap_element(State#state.encap_elements, Line, State);
+read(resphdr_wait, Line, State) ->
+    read_encap_element(State#state.encap_elements, Line, State).
+
+%% @private
+read_encap_element([{ProtocolState, Offset} | Remaining], Line, State) ->
+    Buffered  = State#state.data,
+    Data      = <<Buffered/binary, Line/binary>>,
+    Available = byte_size(Data),
+    Offset    = State#state.encap_offset,
+    {NextProtocolState, NextOffset, Rest} =
+        case Remaining of
+            [{NextP, NextO} | R] ->
+                {NextP, NextO, R};
+            [] ->
+                {request_complete, 0, []}
+        end,
+    Needs = NextOffset-Offset,
+    if Available < Needs ->
+            State#state{data=Data}; % Buffer data 
+       true ->
+            NewState0 = set_encap_data(ProtocolState, Needs, Data, State),
+            NewState  = NewState0#state{protocol_state = NextProtocolState,
+                                        encap_offset   = NextOffset,
+                                        encap_elements = Rest},
+            read_encap_element(Rest, <<>>, NewState)
+    end;
+read_encap_element([], Line, State) ->
+    Buffered = State#state.data,
+    State#state{data           = <<Buffered/binary, Line/binary>>,
+                protocol_state = request_complete}.
+
+
+%% @private
+%% TODO: set request dynamically to avoid copy and paste ...
+set_encap_data(reqhdr_wait, Length, Data, State) ->
+    <<EncapData:Length/binary, Rest/binary>> = Data,
+    Request = State#state.request,
+    State#state{data=Rest,
+                request=Request#icap_request{encap_reqhdr = EncapData}};
+set_encap_data(resphdr_wait, Length, Data, State) ->
+    <<EncapData:Length/binary, Rest/binary>> = Data,
+    Request = State#state.request,
+    State#state{data=Rest,
+                request=Request#icap_request{encap_resphdr = EncapData}};
+set_encap_data(body_wait, Length, Data, State) ->
+    <<EncapData:Length/binary, Rest/binary>> = Data,
+    Request = State#state.request,
+    State#state{data=Rest,
+                request=Request#icap_request{encap_body = EncapData}}.
+    
+%% @private
+parse_encap_offset(Data) ->
+    case match_group_any(?LS, Data) of
+        {ok, Value, Rest} ->
+            {list_to_integer(etbx:to_string(Value)), Rest};
+        {not_found, V} ->
+            {list_to_integer(etbx:to_string(V)), <<>>}
     end.
+            
+%% @private
+parse_encap(<<"req-hdr=", Remaining/binary>>, List) ->
+    {ReqHdrO, Rest} = parse_encap_offset(Remaining),
+    parse_encap(Rest, [{reqhdr_wait, ReqHdrO} | List]);
+parse_encap(<<"res-hdr=", Remaining/binary>>, List) ->
+    {RespHdrO, Rest} = parse_encap_offset(Remaining),         
+    parse_encap(Rest, [{resphdr_wait, RespHdrO} | List]);
+parse_encap(<<"req-body=",Remaining/binary>>, List) ->
+    {BodyO, Rest} = parse_encap_offset(Remaining),
+    parse_encap(Rest, [{body_wait, BodyO} | List]);
+parse_encap(<<"res-body=",Remaining/binary>>, List) ->
+    {BodyO, Rest} = parse_encap_offset(Remaining),
+    parse_encap(Rest, [{body_wait, BodyO} | List]);
+parse_encap(<<"null-body=", Remaining/binary>>, List) ->
+    {BodyO, Rest} = parse_encap_offset(Remaining),
+    parse_encap(Rest, [{null_body, BodyO} | List]);
+parse_encap(<<>>, List) ->
+    lists:reverse(List);
+parse_encap(Junk, _) ->
+    throw({bad_request, Junk}).
+
+parse_encap(Encap) ->
+    parse_encap(Encap, []).
 
 %% @private
 read_line(Data, State) ->
     case match_eol(Data) of
-        {ok, <<$\r>>,    Remaining} ->
-            case State#state.request#icap_request.type of
-                options -> 
-                    if Remaining =/= <<>> -> throw({bad_request, Remaining});
-                       true -> State#state{protocol_state = request_complete,
-                                           data           = <<>>}
-                    end;
-                unknown -> read_line(Remaining, State)
-            end;
+        {ok, <<$\r>>, <<>>} ->
+            State#state{protocol_state = request_complete,
+                        data           = <<>>};
+        {ok, <<$\r>>, Remaining} ->
+            ProtocolState = State#state.protocol_state,
+            NewProtocolState =
+                if ProtocolState =:= headers_wait -> prepare_body;
+                   true -> throw({bad_request, Remaining})
+                end,
+            read(NewProtocolState, 
+                 Remaining,
+                 State#state{protocol_state = NewProtocolState,
+                             data           = Remaining});
         {ok, Line, Remaining} ->
             NewState = read(State#state.protocol_state, Line, State),
             read_line(Remaining, NewState);
         {not_found, Data} ->
-            #state{data=Data}
+            CurrentData = State#state.data,
+            State#state{data = <<CurrentData/binary, Data/binary>>}
     end.
 
 %% @private
@@ -195,6 +324,7 @@ response_code(Type) ->
     case Type of
         ok                    -> <<"200 OK">>;
         accepted              -> <<"202 Accepted">>;
+        no_content            -> <<"204 No content">>;
         bad_request           -> <<"400 Bad request">>;
         unauthorized          -> <<"401 Unauthorized">>;
         not_found             -> <<"404 ICAP Service not found">>;
@@ -207,27 +337,36 @@ response_code(Type) ->
     end.
 
 %% @private
-respond(Socket, Transport, options, Opts, State) ->
+respond(Socket, Transport, Type, Opts, State) ->
     {_Authority, Path} = decode_uri(State#state.request#icap_request.uri),
     case proplists:get_value(routes, Opts) of
         undefined -> send_response(not_found, Socket, Transport);
-        Routes    ->
-            case lists:keyfind(Path, 1, Routes) of
-                false -> send_response(not_found, Socket, Transport);
-                {Path, _, Method} when is_binary(Method) ->
-                    NumAcceptors = proplists:get_value(acceptors, Opts, 1),
-                    Acceptors    = etbx:to_binary(etbx:to_string(NumAcceptors)),
-                    
-                    Date      = httpd_util:rfc1123_date(),
-                    Headers   = [{<<"Methods">>, Method},
-                                 {<<"ISTag">>,   State#state.istag},
-                                 {<<"Date">>,    etbx:to_binary(Date)},
-                                 {<<"Max-Connections">>, Acceptors}],
-                    send_response(ok, Headers, Socket, Transport);
-                BadRoute -> throw({server_error, BadRoute})
-            end
+        Routes    -> 
+            Route = lists:keyfind(Path, 1, Routes),
+            respond(Socket, Transport, Type, Route, Opts, State)
     end.
-            
+           
+respond(Socket, Transport, _Type, false, _Opts, _State) ->
+    send_response(not_found, Socket, Transport);
+respond(Socket, Transport, options, {_, _, _, Method}, Opts, State)
+  when is_binary(Method) ->
+    NumAcceptors = proplists:get_value(acceptors, Opts, 1),
+    Acceptors    = etbx:to_binary(etbx:to_string(NumAcceptors)),
+    
+    Date      = httpd_util:rfc1123_date(),
+    Headers   = [{<<"Methods">>, Method},
+                 {<<"ISTag">>,   State#state.istag},
+                 {<<"Date">>,    etbx:to_binary(Date)},
+                 {<<"Max-Connections">>, Acceptors}],
+    send_response(ok, Headers, Socket, Transport);
+respond(Socket, Transport, _, {_, Module, Handler, _}, _Opts, State) ->
+    case Module:Handler(State#state.request) of
+        Code ->
+            send_response(Code, Socket, Transport)
+    end;
+respond(_, _, _, BadRoute, _, _) ->
+    throw({server_error, BadRoute}).
+ 
 %% @private
 send_response(Code, Socket, Transport) ->
     send_response(Code, [], Socket, Transport).
