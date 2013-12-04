@@ -32,7 +32,4 @@
     
 -type icap_request()::#icap_request{}.
 
-%% @private
-header_value(Name, Request) ->
-    proplists:get_value(Name, Request#icap_request.headers).
 

@@ -23,6 +23,8 @@
 %%
 %% @doc ICAP Protocol implementation
 -module(capsicum_icap).
+-export([header_value/2]).
+-export([match_space/1]).
 -export([start/4]).
 -export([start_link/4]).
 
@@ -42,6 +44,10 @@
 -define(WS, [$ ,$\r, $\n]).
 -define(CRLF, <<"\r\n">>).
 -define(LS, [$ ,$,]).
+
+%% @private
+header_value(Name, Request) ->
+    proplists:get_value(Name, Request#icap_request.headers).
 
 %% @doc Called by ranch to spawn off a process to handle this protocol
 start_link(Ref, Socket, Transport, Opts) ->
@@ -361,8 +367,7 @@ respond(Socket, Transport, options, {_, _, _, Method}, Opts, State)
     send_response(ok, Headers, Socket, Transport);
 respond(Socket, Transport, _, {_, Module, Handler, _}, _Opts, State) ->
     case Module:Handler(State#state.request) of
-        Code ->
-            send_response(Code, Socket, Transport)
+        Code -> send_response(Code, Socket, Transport)
     end;
 respond(_, _, _, BadRoute, _, _) ->
     throw({server_error, BadRoute}).
@@ -390,5 +395,5 @@ send_response(Code, Headers, Body, Socket, Transport) when is_binary(Code) ->
           <<>>,
           Headers),
     Response = [StatusLine, HeaderLines, ?CRLF, Body],
-    io:format("Response:~n~s~n", [iolist_to_binary(Response)]),
+    %%io:format("Response:~n~s~n", [iolist_to_binary(Response)]),
     ok = Transport:send(Socket, Response).
