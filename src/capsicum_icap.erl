@@ -11,7 +11,7 @@
 %% to the following conditions:
 %%
 %% The above copyright notice and this permission notice shall be
-%% included in all copies or substantial portions of the Software.
+%% included in all copies or substantiaxl portions of the Software.
 %%
 %% THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
 %% EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
@@ -326,20 +326,75 @@ decode_uri(<<"icap://", Rest0/binary>>) ->
 decode_uri(BadURI) -> throw({bad_request, BadURI}).
 
 %% @private
-response_code(Type) ->
-    case Type of
-        ok                    -> <<"200 OK">>;
-        accepted              -> <<"202 Accepted">>;
-        no_content            -> <<"204 No content">>;
-        bad_request           -> <<"400 Bad request">>;
-        unauthorized          -> <<"401 Unauthorized">>;
-        not_found             -> <<"404 ICAP Service not found">>;
-        method_not_allowed    -> <<"405 Method not allowed for service">>;
-        request_timeout       -> <<"407 Request timeout">>;
-        server_error          -> <<"500 Server error">>;
-        not_implemented       -> <<"501 Method not implemented">>;
-        service_unavailable   -> <<"503 Service overloaded">>;
-        version_not_supported -> <<"505 ICAP version not supported">>
+response_status(Status) when is_binary(Status) ->
+    Status;
+response_status(Code) when is_number(Code) ->
+    case Code of
+        100 -> <<"100 Continue">>;
+        101 -> <<"101 Switching Protocols">>;
+        200 -> <<"200 OK">>;
+        201 -> <<"201 Created">>;
+        202 -> <<"202 Accepted">>;
+        203 -> <<"203 Non-Authoritative Information">>;
+        204 -> <<"204 No Content">>;
+        205 -> <<"205 Reset Content">>;
+        206 -> <<"206 Partial Content">>;
+        300 -> <<"300 Multiple Choices">>;
+        301 -> <<"301 Moved Permanently">>;
+        302 -> <<"302 Found">>;
+        303 -> <<"303 See Other">>;
+        304 -> <<"304 Not Modified">>;
+        305 -> <<"305 Use Proxy">>;
+        307 -> <<"307 Temporary Redirect">>;
+        400 -> <<"400 Bad Request">>;
+        401 -> <<"401 Unauthorized">>;
+        402 -> <<"402 Payment Required">>;
+        403 -> <<"403 Forbidden">>;
+        404 -> <<"404 Service Not Found">>;
+        405 -> <<"405 Method not Allowed">>;
+        406 -> <<"406 Not Acceptable">>;
+        407 -> <<"407 Proxy Authentication Required">>;
+        408 -> <<"408 Request Timeout">>;
+        409 -> <<"409 Conflict">>;
+        410 -> <<"410 Gone">>;
+        411 -> <<"411 Length Required">>;
+        412 -> <<"412 Precondition Failed">>;
+        413 -> <<"413 Request Entity Too Large">>;
+        414 -> <<"414 Request-URI Too Large">>;
+        415 -> <<"415 Unsupported Media Type">>;
+        416 -> <<"416 Requested Range Not Satisfiable">>;
+        417 -> <<"417 Expectation Failed">>;
+        500 -> <<"500 Internal Server error">>;
+        501 -> <<"501 Method Not Implemented">>;
+        503 -> <<"503 Service Unavailable">>;
+        504 -> <<"504 Gateway Time-out">>;
+        505 -> <<"505 Version not supported">>
+    end;
+response_status(Code) ->
+    case Code of
+	continue	       -> response_status(100);
+        ok                     -> response_status(200);
+        accepted               -> response_status(202);
+        no_content             -> response_status(204);
+	moved_permanently      -> response_status(301);
+	found                  -> response_status(302);
+	see_other	       -> response_status(303);
+	not_modified           -> response_status(304);
+	use_proxy	       -> response_status(305);
+	temporary_redirect     -> response_status(307);
+        bad_request            -> response_status(400);
+        unauthorized           -> response_status(401);
+	forbidden	       -> response_status(403);
+        not_found              -> response_status(404);
+        method_not_allowed     -> response_status(405);
+	not_acceptable         -> response_status(406);
+        request_timeout        -> response_status(407);
+	unsupported_media_type -> response_status(415);
+        server_error           -> response_status(500);
+        not_implemented        -> response_status(501);
+        service_unavailable    -> response_status(503);
+	gateway_timeout        -> response_status(504);
+        version_not_supported  -> response_status(505)
     end.
 
 %% @private
@@ -365,8 +420,13 @@ respond(Socket, Transport, options, {_, _, _, Method}, Opts, State)
                  {<<"Date">>,    etbx:to_binary(Date)},
                  {<<"Max-Connections">>, Acceptors}],
     send_response(ok, Headers, Socket, Transport);
-respond(Socket, Transport, _, {_, Module, Handler, _}, _Opts, State) ->
-    case Module:Handler(State#state.request) of
+respond(Socket, Transport, _, {_, Module, Handler, _}, Opts, State) ->
+    case Module:Handler(State#state.request, Opts) of
+        {Code, Response} when is_record(Response, http_response) ->
+            {EncapHeader, Body} = encapsulate(Response),
+            Headers = [{<<"ISTag">>,   State#state.istag} | 
+                       EncapHeader],
+            send_response(Code, Headers, Body, Socket, Transport);
         Code -> send_response(Code, Socket, Transport)
     end;
 respond(_, _, _, BadRoute, _, _) ->
@@ -381,19 +441,47 @@ send_response(Code, Headers0, Socket, Transport) ->
     Headers = [{<<"Encapsulated">>, <<"null-body=0">>} | Headers0],
     send_response(Code, Headers, <<>>, Socket, Transport).
 
-send_response(Type, Headers, Body, Socket, Transport) when is_atom (Type) ->
-    send_response(response_code(Type), Headers, Body, Socket, Transport);
-send_response(Code, Headers, Body, Socket, Transport) when is_binary(Code) ->
-    Version     = ?VERSION,
+
+send_response(Status, Headers, Body, Socket, Transport) 
+  when is_binary(Status) ->
+    HeaderLines = encode_headers(?VERSION, Status, Headers),
+    Response = [HeaderLines, Body],
+    %%%io:format("Response:~n~s~n", [iolist_to_binary(Response)]),
+    ok = Transport:send(Socket, Response);
+send_response(Code, Headers, Body, Socket, Transport) ->
+    send_response(response_status(Code), Headers, Body, Socket, Transport).
+
+%% @private
+encode_headers(Version, Status, Headers) ->
     CRLF        = ?CRLF,
-    StatusLine  = <<Version/binary, " ", Code/binary, CRLF/binary>>,
-    HeaderLines =
+    StatusLine  = <<Version/binary, " ", Status/binary, CRLF/binary>>,
+    HeaderLines = 
         lists:foldl(
           fun({Name, Value}, Acc) ->
                   <<Acc/binary, Name/binary, ": ", Value/binary, CRLF/binary>>
           end,
-          <<>>,
+          <<StatusLine/binary>>,
           Headers),
-    Response = [StatusLine, HeaderLines, ?CRLF, Body],
-    %%io:format("Response:~n~s~n", [iolist_to_binary(Response)]),
-    ok = Transport:send(Socket, Response).
+    <<HeaderLines/binary, CRLF/binary>>.
+
+%% @private
+encapsulate(Response) ->
+    Status            = response_status(Response#http_response.code),
+    EncapHeaderLines  = encode_headers(<<"HTTP/1.1">>,
+                                       Status,
+                                       Response#http_response.headers),
+
+    EncapHeaderLen    = byte_size(EncapHeaderLines),
+    EncapHeaderLenStr = etbx:to_binary(etbx:to_string(EncapHeaderLen)),
+    Body              = Response#http_response.body,
+    BodyEncapTag =    case Body of
+                          <<>> -> <<"null-body=">>;
+                          _    -> <<"res-body=">>
+                      end,
+    Encapsulation = <<"res-hdr=0, ", 
+                      BodyEncapTag/binary, 
+                      EncapHeaderLenStr/binary>>,
+    {[{<<"Encapsulated">>, Encapsulation}],
+     [EncapHeaderLines, Body]}.
+    
+            

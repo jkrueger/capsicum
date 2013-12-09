@@ -22,14 +22,18 @@
 %% WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 %%
 
--record(icap_request, {uri::binary(),
-                       type=unknown::atom(),
-                       headers=[]::[tuple()],
-                       encap_reqhdr::binary(),
-                       encap_resphdr::binary(),
-                       encap_body::binary()
+-record(icap_request, {uri              ::binary(),
+                       type    = unknown::atom(),
+                       headers = []     ::[tuple()],
+                       encap_reqhdr     ::binary(),
+                       encap_resphdr    ::binary(),
+                       encap_body       ::binary()
                       }).
     
 -type icap_request()::#icap_request{}.
 
+-record(http_response, {code          ::atom()|number(),
+                        headers = []  ::[tuple()],
+                        body    = <<>>::binary()}).
 
+-type http_response()::#http_response{}.
