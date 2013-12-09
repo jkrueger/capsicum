@@ -211,7 +211,12 @@ read(body_wait, Line, State) ->
 read(reqhdr_wait, Line, State) ->
     read_encap_element(State#state.encap_elements, Line, State);
 read(resphdr_wait, Line, State) ->
-    read_encap_element(State#state.encap_elements, Line, State).
+    read_encap_element(State#state.encap_elements, Line, State);
+read(request_complete, Line, State) ->
+    %% WTF?
+    io:format("Unexpected data by request complete: ~s~nSTATE: ~p", 
+              [Line, State]),
+    State.
 
 %% @private
 read_encap_element([{ProtocolState, Offset} | Remaining], Line, State) ->
@@ -447,7 +452,12 @@ send_response(Status, Headers, Body, Socket, Transport)
     HeaderLines = encode_headers(?VERSION, Status, Headers),
     Response = [HeaderLines, Body],
     %%%io:format("Response:~n~s~n", [iolist_to_binary(Response)]),
-    ok = Transport:send(Socket, Response);
+    case Transport:send(Socket, Response) of
+        {error, Reason} ->
+            io:format("connection closed by client"),
+            {error, Reason};
+        ok -> ok
+    end;
 send_response(Code, Headers, Body, Socket, Transport) ->
     send_response(response_status(Code), Headers, Body, Socket, Transport).
 
