@@ -21,10 +21,9 @@
 %% CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 %% WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 %%
-%% @doc ICAP Protocol implementation
+%% @doc ICAP Protocol server implementation
 -module(capsicum_icap).
 -export([header_value/2]).
--export([match_space/1]).
 -export([start/4]).
 -export([start_link/4]).
 
@@ -47,11 +46,14 @@
 -define(CRLF, <<"\r\n">>).
 -define(LS, [$ ,$,]).
 
-%% @private
+%% @doc Utility function to extract a particular header value from an ICAP
+%% request
+-spec(header_value(binary(), icap_request()) -> binary() | undefined).
 header_value(Name, Request) ->
     proplists:get_value(Name, Request#icap_request.headers).
 
-%% @doc Called by ranch to spawn off a process to handle this protocol
+%% @private
+%% @doc Called by Ranch to spawn off a process to handle this protocol. 
 start_link(Ref, Socket, Transport, Opts) ->
     Pid = spawn_link(?MODULE, start, [Ref, Socket, Transport, Opts]),
     {ok, Pid}.
@@ -65,7 +67,6 @@ start(Ref, Socket, Transport, Opts) ->
     ISTag   = etbx:to_binary(httpd_util:integer_to_hexlist(Seconds)),
     loop(Socket, Transport, Timeout, Opts, #state{istag=ISTag}).
 
-%% @private
 -ifdef(DEBUG).
 maybe_log(Data, State) ->
     Logged=State#state.logged,
@@ -78,9 +79,13 @@ debug(Format) ->
     io:format(Format).
 -else.
 
+%% @private
 maybe_log(_, State) -> State.
+%% @private
 debug(_, _) -> undefined.
+%% @private
 debug(_)    -> undefined.
+
 -endif.
 
 %% @private
@@ -91,13 +96,14 @@ loop(Socket, Transport, Timeout, Opts, State0) ->
                 State = maybe_log(Incoming, State0),
                 NewState = read(State#state.protocol_state, Incoming, State),
 
-                if NewState#state.errored ->
+                if NewState#state.errored or 
+                   (NewState#state.protocol_state =/= request_complete) ->
                         loop(Socket, Transport, Timeout, Opts, NewState);
-                   NewState#state.protocol_state =:= request_complete ->
+                   true ->
                         RequestType = NewState#state.request#icap_request.type,
-                        respond(Socket, Transport, RequestType, Opts, NewState);
-                   true -> loop(Socket, Transport, Timeout, Opts, NewState)
+                        respond(Socket, Transport, RequestType, Opts, NewState)
                 end;
+
             Error ->
                 if State0#state.errored ->
                         debug("Timing out errored connection: ~n~s~n~p~n",

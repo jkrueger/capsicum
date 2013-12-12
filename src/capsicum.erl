@@ -27,6 +27,22 @@
 -export([start/0]).
 -export([start_icap/4]).
 
+%% @doc Starts an ICAP server
+%% this is pretty much the main and only function that a given server
+%% implementation needs to call. It will start the server with the given
+%% Name, number of listeners (i.e. Acceptors), options to pass to Ranch and 
+%% finally the options for the icap server. Current options are:
+%% {timeout, number()} -> time in milliseconds to wait before giving up on a
+%%                        connection
+%% {routes, Descriptors} -> list of ICAP routes to map URIs to service modules.
+%% 
+%% Descriptors = list(Descriptor)
+%% Descriptor  = {URI::string(), 
+%%                Module::atom(),
+%%                Function::atom(),
+%%                RequestType::binary()}
+%% 
+%% 
 -spec(start_icap(atom(), number(), [tuple()], [tuple()]) -> 
              {ok, pid()} | {error, any()}).
 start_icap(Name, Acceptors, RanchOpts, Opts) ->
@@ -37,6 +53,7 @@ start_icap(Name, Acceptors, RanchOpts, Opts) ->
                          capsicum_icap,
                          Opts).
 
+%% @doc starts Capsicum application and all its dependencies
 -spec(start() -> {ok, list()}).
 start() ->
     etbx:start_app(capsicum).

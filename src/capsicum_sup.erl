@@ -1,3 +1,4 @@
+%% @private
 -module(capsicum_sup).
 
 -behaviour(supervisor).
