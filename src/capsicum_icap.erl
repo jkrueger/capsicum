@@ -38,7 +38,9 @@
                 istag::binary(),
                 encap_offset::number(),
                 encap_elements::list(),
-                data = <<>>::binary()}).
+                errored=false::boolean(),
+                data   = <<>>::binary(),
+                logged = <<>>::binary()}).
 
 -define(VERSION, <<"ICAP/1.0">>).
 -define(WS, [$ ,$\r, $\n]).
@@ -64,28 +66,56 @@ start(Ref, Socket, Transport, Opts) ->
     loop(Socket, Transport, Timeout, Opts, #state{istag=ISTag}).
 
 %% @private
-loop(Socket, Transport, Timeout, Opts, State) ->
+-ifdef(DEBUG).
+maybe_log(Data, State) ->
+    Logged=State#state.logged,
+    NLogged = <<Logged/binary, Data/binary>>,
+    State#state{logged=NLogged}.
+
+debug(Format, Args) ->
+    io:format(Format, Args).
+debug(Format) ->
+    io:format(Format).
+-else.
+
+maybe_log(_, State) -> State.
+debug(_, _) -> undefined.
+debug(_)    -> undefined.
+-endif.
+
+%% @private
+loop(Socket, Transport, Timeout, Opts, State0) ->
     try
         case Transport:recv(Socket, 0, Timeout) of
             {ok, Incoming} ->
-                NewState = read(Incoming, State),
-                if NewState#state.protocol_state =:= request_complete ->
+                State = maybe_log(Incoming, State0),
+                NewState = read(State#state.protocol_state, Incoming, State),
+
+                if NewState#state.errored ->
+                        loop(Socket, Transport, Timeout, Opts, NewState);
+                   NewState#state.protocol_state =:= request_complete ->
                         RequestType = NewState#state.request#icap_request.type,
                         respond(Socket, Transport, RequestType, Opts, NewState);
                    true -> loop(Socket, Transport, Timeout, Opts, NewState)
                 end;
             Error ->
-                ok = Transport:close(Socket),
-                throw(Error)
+                if State0#state.errored ->
+                        debug("Timing out errored connection: ~n~s~n~p~n",
+                              [State0#state.logged,
+                               State0#state{logged = <<"SNIP">>}]);
+                   true ->
+                        ok = Transport:close(Socket),
+                        throw(Error)
+                end
         end
     catch
         {Type, Description} ->
-            io:format("Error: ~p ~s~n~p~n", [Type, 
-                                             Description,
-                                             erlang:get_stacktrace()]),
+            debug("Error: ~p ~s~n~p~n", [Type, 
+                                         Description,
+                                         erlang:get_stacktrace()]),
             send_response(Type, Socket, Transport);
         _Exception:Reason ->
-            io:format("Internal ~p:~p~n", [Reason, 
+            debug("Internal ~p:~p~n", [Reason, 
                                            erlang:get_stacktrace()]),
             send_response(server_error, Socket, Transport)
     end.
@@ -143,12 +173,6 @@ match_group_any(List, Data) ->
     match_group_any(List, Data, <<>>).
 
 %% @private
-read(Incoming, State) ->
-    PrevData = State#state.data,
-    Data     = <<Incoming/binary, PrevData/binary>>,
-    read_line(Data, State).
-
-%% @private
 read_request(Type, Parameters, State) ->
     case match_space(Parameters) of
         {ok, URI, Remaining} ->
@@ -158,64 +182,104 @@ read_request(Type, Parameters, State) ->
                 {not_found, _}    -> throw({bad_request, Remaining})
             end,
             IcapRequest = #icap_request{uri=URI, type=Type},
+            debug("~p [~s]\n", [Type, URI]),
             State#state{request        = IcapRequest,
-                        protocol_state = headers_wait,
-                        data           = <<>>};
+                        protocol_state = headers_wait};
         {not_found, _} ->
             throw({bad_request, Parameters})
     end.
 
 %% @private
-read(request_wait, Request, State) ->
-    {Type, Parameters} =  case Request of 
-                              <<"OPTIONS ", Rest/binary>> -> {options,  Rest};
-                              <<"REQMOD ",  Rest/binary>> -> {reqmod,   Rest};
-                              <<"RESPMOD ", Rest/binary>> -> {respmod,  Rest};
-                              _ -> throw({bad_request, Request})
-                          end,
-    read_request(Type, Parameters, State);
-read(headers_wait, Line, State) ->
-    case match_space(Line) of 
-        {ok, Name0, Rest} ->
-            %% get rid of the trailing semicolon (which *has* to be there)
-            NLast = binary:last(Name0),
-            Name  = if NLast =/= $: ->
-                            throw({bad_request, Name0});
-                       true ->
-                            binary:part(Name0, {0, byte_size(Name0) - 1})
-                    end,
-            VLast = binary:last(Rest),
-            Value = if  VLast =:= $\r ->
-                            binary:part(Rest, {0, byte_size(Rest) - 1});
-                       true -> VLast
-                    end,
-            Request = State#state.request,
-            Headers  = [ {Name, Value} | Request#icap_request.headers ],
-            State#state{request = Request#icap_request{headers=Headers},
-                        data    = <<>>};
-        {not_found, Line} ->
-            throw({bad_request, Line})
+read(request_wait, Incoming, State0) ->
+    debug("\n-> request_wait..."),
+    case read_line(Incoming, State0) of
+        State when is_record(State, state) -> 
+            debug("buffering...~n"),
+            State;
+        {State, Line} ->
+            {Type, Parameters} =  
+                case Line of 
+                    <<"OPTIONS ", Rest/binary>> -> {options,  Rest};
+                    <<"REQMOD ",  Rest/binary>> -> {reqmod,   Rest};
+                    <<"RESPMOD ", Rest/binary>> -> {respmod,  Rest};
+                    _ -> throw({bad_request, Line})
+                end,
+            NewState = read_request(Type, Parameters, State),
+            read(NewState#state.protocol_state, <<>>, NewState)
     end;
-read(prepare_body, Line, State) ->
+read(headers_wait, Incoming, State0) ->
+    debug("-> headers_wait..."),
+    case read_line(Incoming, State0) of
+        State when is_record(State, state) ->
+            debug("buffering...~n"),
+            State;
+        {State, <<"\r">>} ->
+            %% Done reading in headers..
+            read(prepare_body, <<>>, State);
+        {State, Line} ->
+            case match_space(Line) of 
+                {ok, Name0, Rest} ->
+                    %% get rid of the trailing semicolon 
+                    %% (which *has* to be there)
+                    NLast = binary:last(Name0),
+                    Name  =
+                        if NLast =/= $: ->
+                                throw({bad_request, Name0});
+                           true ->
+                                binary:part(Name0, {0, byte_size(Name0) - 1})
+                        end,
+                    VLast = binary:last(Rest),
+                    Value = 
+                        if  VLast =:= $\r ->
+                                binary:part(Rest, {0, byte_size(Rest) - 1});
+                            true -> VLast
+                        end,
+                    Request = State#state.request,
+                    Headers  = [ {Name, Value} | Request#icap_request.headers ],
+                    debug("~s...", [Name]),
+                    NewState =
+                        State#state{
+                          request = Request#icap_request{headers=Headers},
+                          protocol_state = headers_wait},
+                    read(headers_wait, <<>>, NewState);
+                {not_found, Line} ->
+                    throw({bad_request, Line})
+            end
+    end;
+read(prepare_body, Incoming, State) ->
     Encap  = header_value(<<"Encapsulated">>, State#state.request),
-    Elements = parse_encap(Encap),
-    [{ProtocolState, _} | _] = Elements,
-    NewState = State#state {encap_offset   = 0,
-                            encap_elements = Elements,
-                            protocol_state = ProtocolState},
-    read(ProtocolState, Line, NewState);
-read(null_body, Line, State) ->
-    read_encap_element(State#state.encap_elements, Line, State);
-read(body_wait, Line, State) ->
-    read_encap_element(State#state.encap_elements, Line, State);
-read(reqhdr_wait, Line, State) ->
-    read_encap_element(State#state.encap_elements, Line, State);
-read(resphdr_wait, Line, State) ->
-    read_encap_element(State#state.encap_elements, Line, State);
-read(request_complete, Line, State) ->
-    %% WTF?
-    io:format("Unexpected data by request complete: ~s~nSTATE: ~p", 
-              [Line, State]),
+    if Encap =/= undefined ->
+            debug("-> prepare body ~s~n", [Encap]),
+            Elements = parse_encap(Encap),
+            [{ProtocolState, _} | _] = Elements,
+            NewState = State#state {encap_offset   = 0,
+                                    encap_elements = Elements,
+                                    protocol_state = ProtocolState},
+            read(ProtocolState, Incoming, NewState);
+       true -> 
+            NewState = State#state{protocol_state=request_complete},
+            read(request_complete, Incoming, NewState)
+    end;
+read(null_body, Data, State) ->
+    debug("-> null_body..."),
+    read_encap_element(State#state.encap_elements, Data, State);
+read(body_wait, Data, State) ->
+    debug("-> body_wait..."),
+    read_encap_element(State#state.encap_elements, Data, State);
+read(reqhdr_wait, Data, State) ->
+    debug("-> reqhdr_wait..."),
+    read_encap_element(State#state.encap_elements, Data, State);
+read(resphdr_wait, Data, State) ->
+    debug("resphdr_wait->..."),
+    read_encap_element(State#state.encap_elements, Data, State);
+read(request_complete, Data, State) ->
+    debug("request_complete"),
+    RemainingBytes = byte_size(Data),
+    if RemainingBytes =/= 0 ->
+            debug(" (still remaining: ~b bytes: ~s)\n", [RemainingBytes, Data]);
+       true -> 
+            debug(".\n")
+    end,
     State.
 
 %% @private
@@ -224,6 +288,7 @@ read_encap_element([{ProtocolState, Offset} | Remaining], Line, State) ->
     Data      = <<Buffered/binary, Line/binary>>,
     Available = byte_size(Data),
     Offset    = State#state.encap_offset,
+
     {NextProtocolState, NextOffset, Rest} =
         case Remaining of
             [{NextP, NextO} | R] ->
@@ -233,19 +298,26 @@ read_encap_element([{ProtocolState, Offset} | Remaining], Line, State) ->
         end,
     Needs = NextOffset-Offset,
     if Available < Needs ->
-            State#state{data=Data}; % Buffer data 
+            debug("~b available (needs ~b (offset ~b)~n", 
+                  [Available, Needs, Offset]),
+            State#state{data=Data}; % Buffer data
        true ->
-            NewState0 = set_encap_data(ProtocolState, Needs, Data, State),
-            NewState  = NewState0#state{protocol_state = NextProtocolState,
+            debug("take ~b from available ~b offset=~b next=~b~n", 
+                  [Needs, Available, Offset, NextOffset]),
+            <<EncapData:Needs/binary, ToBuffer/binary>> = Data,
+            NewState0 = set_encap_data(ProtocolState, Needs, EncapData, State),
+            NewState  = NewState0#state{data=ToBuffer,
+                                        protocol_state = NextProtocolState,
                                         encap_offset   = NextOffset,
                                         encap_elements = Rest},
             read_encap_element(Rest, <<>>, NewState)
     end;
 read_encap_element([], Line, State) ->
     Buffered = State#state.data,
+    debug("done reading encap elements (left ~b bytes behind)~n",
+         [byte_size(State#state.data) + byte_size(Line)]),
     State#state{data           = <<Buffered/binary, Line/binary>>,
                 protocol_state = request_complete}.
-
 
 %% @private
 %% TODO: set request dynamically to avoid copy and paste ...
@@ -299,27 +371,14 @@ parse_encap(Encap) ->
     parse_encap(Encap, []).
 
 %% @private
-read_line(Data, State) ->
+read_line(Incoming, State) ->
+    PrevData = State#state.data,
+    Data     = <<Incoming/binary, PrevData/binary>>,
     case match_eol(Data) of
-        {ok, <<$\r>>, <<>>} ->
-            State#state{protocol_state = request_complete,
-                        data           = <<>>};
-        {ok, <<$\r>>, Remaining} ->
-            ProtocolState = State#state.protocol_state,
-            NewProtocolState =
-                if ProtocolState =:= headers_wait -> prepare_body;
-                   true -> throw({bad_request, Remaining})
-                end,
-            read(NewProtocolState, 
-                 Remaining,
-                 State#state{protocol_state = NewProtocolState,
-                             data           = Remaining});
         {ok, Line, Remaining} ->
-            NewState = read(State#state.protocol_state, Line, State),
-            read_line(Remaining, NewState);
+            {State#state{data=Remaining}, Line};
         {not_found, Data} ->
-            CurrentData = State#state.data,
-            State#state{data = <<CurrentData/binary, Data/binary>>}
+            State#state{data = Data}
     end.
 
 %% @private
@@ -451,10 +510,10 @@ send_response(Status, Headers, Body, Socket, Transport)
   when is_binary(Status) ->
     HeaderLines = encode_headers(?VERSION, Status, Headers),
     Response = [HeaderLines, Body],
-    %%%io:format("Response:~n~s~n", [iolist_to_binary(Response)]),
+    %%%debug("Response:~n~s~n", [iolist_to_binary(Response)]),
     case Transport:send(Socket, Response) of
         {error, Reason} ->
-            io:format("connection closed by client"),
+            debug("connection closed by client"),
             {error, Reason};
         ok -> ok
     end;
