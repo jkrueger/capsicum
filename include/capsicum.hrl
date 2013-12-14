@@ -37,3 +37,8 @@
                         body    = <<>>::binary()}).
 
 -type http_response()::#http_response{}.
+
+-record(http_premade_request, {header::binary(),
+                               body::binary()}).
+
+-type http_premade_request()::#http_premade_request{}.

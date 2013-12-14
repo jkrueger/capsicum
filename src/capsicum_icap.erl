@@ -492,7 +492,7 @@ respond(Socket, Transport, options, {_, _, _, Method}, Opts, State)
     send_response(ok, Headers, Socket, Transport);
 respond(Socket, Transport, _, {_, Module, Handler, _}, Opts, State) ->
     case Module:Handler(State#state.request, Opts) of
-        {Code, Response} when is_record(Response, http_response) ->
+        {Code, Response} ->
             {EncapHeader, Body} = encapsulate(Response),
             Headers = [{<<"ISTag">>,   State#state.istag} | 
                        EncapHeader],
@@ -540,23 +540,36 @@ encode_headers(Version, Status, Headers) ->
     <<HeaderLines/binary, CRLF/binary>>.
 
 %% @private
-encapsulate(Response) ->
+encapsulate(Response) when is_record(Response, http_response) ->
     Status            = response_status(Response#http_response.code),
-    EncapHeaderLines  = encode_headers(<<"HTTP/1.1">>,
+    Header            = encode_headers(<<"HTTP/1.1">>,
                                        Status,
                                        Response#http_response.headers),
-
-    EncapHeaderLen    = byte_size(EncapHeaderLines),
-    EncapHeaderLenStr = etbx:to_binary(etbx:to_string(EncapHeaderLen)),
     Body              = Response#http_response.body,
-    BodyEncapTag =    case Body of
-                          <<>> -> <<"null-body=">>;
-                          _    -> <<"res-body=">>
-                      end,
-    Encapsulation = <<"res-hdr=0, ", 
+    encapsulate(<<"res-hdr=0, ">>, 
+                <<"null-body=">>,
+                <<"res-body=">>, 
+                Header,
+                Body);
+encapsulate(Response) when is_record(Response, http_premade_request) ->
+    Header            = Response#http_premade_request.header,
+    Body              = Response#http_premade_request.body,
+    encapsulate(<<"req-hdr=0, ">>, 
+                <<"null-body=">>,
+                <<"req-body=">>, 
+                Header, 
+                Body).
+
+%% @private
+encapsulate(HeaderTag, NullBodyTag, BodyTag, Header, Body) ->
+    EncapHeaderLen    = byte_size(Header),
+    EncapHeaderLenStr = etbx:to_binary(etbx:to_string(EncapHeaderLen)),
+    BodyEncapTag      = case Body of
+                            <<>> -> NullBodyTag;
+                            _    -> BodyTag
+                        end,
+    Encapsulation = <<HeaderTag/binary,
                       BodyEncapTag/binary, 
                       EncapHeaderLenStr/binary>>,
     {[{<<"Encapsulated">>, Encapsulation}],
-     [EncapHeaderLines, Body]}.
-    
-            
+     [Header, Body]}.
