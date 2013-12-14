@@ -116,14 +116,13 @@ loop(Socket, Transport, Timeout, Opts, State0) ->
         end
     catch
         {Type, Description} ->
-            debug("Error: ~p ~s~n~p~n", [Type, 
-                                         Description,
-                                         erlang:get_stacktrace()]),
-            send_response(Type, Socket, Transport);
+            EError= {error, {Type, Description, erlang:get_stacktrace()}},
+            send_response(Type, Socket, Transport),
+            throw(EError);
         _Exception:Reason ->
-            debug("Internal ~p:~p~n", [Reason, 
-                                           erlang:get_stacktrace()]),
-            send_response(server_error, Socket, Transport)
+            EError= {error, Reason, erlang:get_stacktrace()},
+            send_response(server_error, Socket, Transport),
+            throw(EError)
     end.
 
 %% @private
@@ -497,7 +496,8 @@ respond(Socket, Transport, _, {_, Module, Handler, _}, Opts, State) ->
             Headers = [{<<"ISTag">>,   State#state.istag} | 
                        EncapHeader],
             send_response(Code, Headers, Body, Socket, Transport);
-        Code -> send_response(Code, Socket, Transport)
+        Code when is_atom(Code)   -> send_response(Code, Socket, Transport);
+        Code when is_number(Code) -> send_response(Code, Socket, Transport)
     end;
 respond(_, _, _, BadRoute, _, _) ->
     throw({server_error, BadRoute}).
@@ -516,7 +516,7 @@ send_response(Status, Headers, Body, Socket, Transport)
   when is_binary(Status) ->
     HeaderLines = encode_headers(?VERSION, Status, Headers),
     Response = [HeaderLines, Body],
-    %%%debug("Response:~n~s~n", [iolist_to_binary(Response)]),
+    debug("Response:~n~s~n", [iolist_to_binary(Response)]),
     case Transport:send(Socket, Response) of
         {error, Reason} ->
             debug("connection closed by client"),
@@ -561,6 +561,8 @@ encapsulate(Response) when is_record(Response, http_premade_request) ->
                 Body).
 
 %% @private
+encapsulate(HeaderTag, NullBodyTag, BodyTag, Header, undefined) ->
+    encapsulate(HeaderTag, NullBodyTag, BodyTag, Header, <<>>);
 encapsulate(HeaderTag, NullBodyTag, BodyTag, Header, Body) ->
     EncapHeaderLen    = byte_size(Header),
     EncapHeaderLenStr = etbx:to_binary(etbx:to_string(EncapHeaderLen)),
