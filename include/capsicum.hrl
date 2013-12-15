@@ -27,7 +27,7 @@
                        headers = []     ::[tuple()],
                        encap_reqhdr     ::binary(),
                        encap_resphdr    ::binary(),
-                       encap_body = <<>>::binary()
+                       encap_body = []  ::list()
                       }).
     
 -type icap_request()::#icap_request{}.

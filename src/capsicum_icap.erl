@@ -297,7 +297,10 @@ read(body_wait, Incoming, State0) ->
     if Needs == 0 ->
             %% done :)
             debug("end of body~n"),
-            State1#state{protocol_state=request_complete};
+            Request   = State1#state.request,
+            EncapBody = lists:reverse(Request#icap_request.encap_body),
+            State1#state{protocol_state=request_complete,
+                         request=Request#icap_request{encap_body=EncapBody}};
        Needs > Available ->
             %% try again later..
             debug("~b available (needs ~b)~n",
@@ -313,7 +316,7 @@ read(body_wait, Incoming, State0) ->
             Request   = State1#state.request,
             EncapBody = Request#icap_request.encap_body,
 
-            NewEncapBody = <<EncapBody/binary, Chunk/binary>>,
+            NewEncapBody = [{ActualNeeds, Chunk} | EncapBody],
             NewRequest   = Request#icap_request{encap_body=NewEncapBody},
             NewState = State1#state{data=ToBuffer,
                                     encap_elements=[],
@@ -556,7 +559,7 @@ send_response(Status, Headers, Body, Socket, Transport)
   when is_binary(Status) ->
     HeaderLines = encode_headers(?VERSION, Status, Headers),
     Response = [HeaderLines, Body],
-    debug("Response:~n~s~n", [iolist_to_binary(Response)]),
+    debug("Response:~n~p~n", [Response]),
     case Transport:send(Socket, Response) of
         {error, Reason} ->
             debug("connection closed by client"),
@@ -585,7 +588,7 @@ encapsulate(Response) when is_record(Response, http_response) ->
     Header            = encode_headers(<<"HTTP/1.1">>,
                                        Status,
                                        Response#http_response.headers),
-    Body              = Response#http_response.body,
+    Body              = chunks_to_iolist(Response#http_response.body),
     encapsulate(<<"res-hdr=0, ">>, 
                 <<"null-body=">>,
                 <<"res-body=">>, 
@@ -593,7 +596,7 @@ encapsulate(Response) when is_record(Response, http_response) ->
                 Body);
 encapsulate(Response) when is_record(Response, http_premade_request) ->
     Header            = Response#http_premade_request.header,
-    Body              = Response#http_premade_request.body,
+    Body              = chunks_to_iolist(Response#http_premade_request.body),
     encapsulate(<<"req-hdr=0, ">>, 
                 <<"null-body=">>,
                 <<"req-body=">>, 
@@ -615,3 +618,15 @@ encapsulate(HeaderTag, NullBodyTag, BodyTag, Header, Body) ->
                       EncapHeaderLenStr/binary>>,
     {[{<<"Encapsulated">>, Encapsulation}],
      [Header, Body]}.
+
+%% @private
+chunks_to_iolist(Chunks) when is_list(Chunks)->
+    lists:foldr(
+      fun({Length, Chunk}, Acc) ->
+              [[integer_to_binary(Length, 16), ?CRLF, Chunk] | Acc]
+      end,
+      [<<"0">>, ?CRLF, ?CRLF],
+      Chunks);
+chunks_to_iolist(Chunks) when is_binary(Chunks) ->
+    Length = byte_size(Chunks),
+    [integer_to_binary(Length, 16), ?CRLF, Chunks, <<"0">>, ?CRLF, ?CRLF].
