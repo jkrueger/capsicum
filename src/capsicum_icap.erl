@@ -65,7 +65,18 @@ start(Ref, Socket, Transport, Opts) ->
     Time    = calendar:universal_time(),
     Seconds = calendar:datetime_to_gregorian_seconds(Time),
     ISTag   = etbx:to_binary(httpd_util:integer_to_hexlist(Seconds)),
-    loop(Socket, Transport, Timeout, Opts, #state{istag=ISTag}).
+    try
+        loop(Socket, Transport, Timeout, Opts, #state{istag=ISTag})
+    catch
+        {Type, Description} ->
+            EError= {error, {Type, Description, erlang:get_stacktrace()}},
+            send_response(Type, Socket, Transport),
+            throw(EError);
+        _Exception:Reason ->
+            EError= {error, Reason, erlang:get_stacktrace()},
+            send_response(server_error, Socket, Transport),
+            throw(EError)
+    end.
 
 -ifdef(DEBUG).
 maybe_log(Data, State) ->
@@ -90,39 +101,28 @@ debug(_)    -> undefined.
 
 %% @private
 loop(Socket, Transport, Timeout, Opts, State0) ->
-    try
-        case Transport:recv(Socket, 0, Timeout) of
-            {ok, Incoming} ->
-                State = maybe_log(Incoming, State0),
-                NewState = read(State#state.protocol_state, Incoming, State),
-
-                if NewState#state.errored or 
-                   (NewState#state.protocol_state =/= request_complete) ->
-                        loop(Socket, Transport, Timeout, Opts, NewState);
+    case Transport:recv(Socket, 0, Timeout) of
+        {ok, Incoming} ->
+            State = maybe_log(Incoming, State0),
+            NewState = read(State#state.protocol_state, Incoming, State),
+            
+            if NewState#state.errored or 
+               (NewState#state.protocol_state =/= request_complete) ->
+                    loop(Socket, Transport, Timeout, Opts, NewState);
+               true ->
+                    RequestType = NewState#state.request#icap_request.type,
+                    respond(Socket, Transport, RequestType, Opts, NewState)
+            end;
+        
+        Error ->
+            if State0#state.errored ->
+                    debug("Timing out errored connection: ~n~s~n~p~n",
+                          [State0#state.logged,
+                           State0#state{logged = <<"SNIP">>}]);
                    true ->
-                        RequestType = NewState#state.request#icap_request.type,
-                        respond(Socket, Transport, RequestType, Opts, NewState)
-                end;
-
-            Error ->
-                if State0#state.errored ->
-                        debug("Timing out errored connection: ~n~s~n~p~n",
-                              [State0#state.logged,
-                               State0#state{logged = <<"SNIP">>}]);
-                   true ->
-                        ok = Transport:close(Socket),
-                        throw(Error)
-                end
-        end
-    catch
-        {Type, Description} ->
-            EError= {error, {Type, Description, erlang:get_stacktrace()}},
-            send_response(Type, Socket, Transport),
-            throw(EError);
-        _Exception:Reason ->
-            EError= {error, Reason, erlang:get_stacktrace()},
-            send_response(server_error, Socket, Transport),
-            throw(EError)
+                    ok = Transport:close(Socket),
+                    throw(Error)
+            end
     end.
 
 %% @private
@@ -265,12 +265,61 @@ read(prepare_body, Incoming, State) ->
             NewState = State#state{protocol_state=request_complete},
             read(request_complete, Incoming, NewState)
     end;
-read(null_body, Data, State) ->
-    debug("-> null_body..."),
-    read_encap_element(State#state.encap_elements, Data, State);
-read(body_wait, Data, State) ->
+read(body_wait, Incoming, State0) ->
     debug("-> body_wait..."),
-    read_encap_element(State#state.encap_elements, Data, State);
+    {Needs, State1} =
+        case State0#state.encap_elements of
+            [] -> 
+                %% chunk starts
+                case read_line(Incoming, State0) of
+                    {NState, Line} ->
+                        debug("~p chunk starts...", [Line]),
+                        SizeLength = byte_size(Line)-1, % chop off trailing \r
+                        ChunkSize  = <<Line:SizeLength/binary>>,
+                        %% + 2 to account for last CRLF which is not strictly
+                        %% part of the chunk, unless it is a zero chunk in which
+                        %% case.. well.. there is no CRLF of course.
+                        V = case binary_to_integer(ChunkSize, 16) of
+                                0 -> 0;
+                                X -> X+2
+                            end,
+                        {V, NState#state{encap_elements=V}};
+                    NState ->
+                        {9999999999, NState}
+                end;
+            V  -> 
+                Buffered = State0#state.data,
+                Data     = <<Buffered/binary, Incoming/binary>>,
+                {V, State0#state{data=Data}}
+        end,
+    CurrentData = State1#state.data,
+    Available = byte_size(CurrentData),
+    if Needs == 0 ->
+            %% done :)
+            debug("end of body~n"),
+            State1#state{protocol_state=request_complete};
+       Needs > Available ->
+            %% try again later..
+            debug("~b available (needs ~b)~n",
+                  [Available, Needs]),
+            State1;
+       true ->
+            debug("take ~b from available ~b~n", [Needs, Available]),
+            %% as pointed above, need to account for extra CRLF at the end
+            %% of the chunk .. so - 2 here...
+            ActualNeeds = Needs - 2,
+            <<Chunk:ActualNeeds/binary, _CR , _LF, ToBuffer/binary>> = 
+                CurrentData,
+            Request   = State1#state.request,
+            EncapBody = Request#icap_request.encap_body,
+
+            NewEncapBody = <<EncapBody/binary, Chunk/binary>>,
+            NewRequest   = Request#icap_request{encap_body=NewEncapBody},
+            NewState = State1#state{data=ToBuffer,
+                                    encap_elements=[],
+                                    request=NewRequest},
+            read(body_wait, <<>>, NewState)
+    end;
 read(reqhdr_wait, Data, State) ->
     debug("-> reqhdr_wait..."),
     read_encap_element(State#state.encap_elements, Data, State);
@@ -288,20 +337,16 @@ read(request_complete, Data, State) ->
     State.
 
 %% @private
-read_encap_element([{ProtocolState, Offset} | Remaining], Line, State) ->
+read_encap_element([{ProtocolState, Offset} | Remaining], Incoming, State) ->
     Buffered  = State#state.data,
-    Data      = <<Buffered/binary, Line/binary>>,
+    Data      = <<Buffered/binary, Incoming/binary>>,
     Available = byte_size(Data),
     Offset    = State#state.encap_offset,
 
-    {NextProtocolState, NextOffset, Rest} =
-        case Remaining of
-            [{NextP, NextO} | R] ->
-                {NextP, NextO, R};
-            [] ->
-                {request_complete, 0, []}
-        end,
+    [{NextProtocolState, NextOffset} | Rest] = Remaining,
+
     Needs = NextOffset-Offset,
+
     if Available < Needs ->
             debug("~b available (needs ~b (offset ~b)~n", 
                   [Available, Needs, Offset]),
@@ -315,13 +360,13 @@ read_encap_element([{ProtocolState, Offset} | Remaining], Line, State) ->
                                         protocol_state = NextProtocolState,
                                         encap_offset   = NextOffset,
                                         encap_elements = Rest},
-            read_encap_element(Rest, <<>>, NewState)
+            read(NextProtocolState, <<>>, NewState)
     end;
-read_encap_element([], Line, State) ->
+read_encap_element([], Incoming, State) ->
     Buffered = State#state.data,
     debug("done reading encap elements (left ~b bytes behind)~n",
-         [byte_size(State#state.data) + byte_size(Line)]),
-    State#state{data           = <<Buffered/binary, Line/binary>>,
+         [byte_size(State#state.data) + byte_size(Incoming)]),
+    State#state{data           = <<Buffered/binary, Incoming/binary>>,
                 protocol_state = request_complete}.
 
 %% @private
@@ -335,12 +380,7 @@ set_encap_data(resphdr_wait, Length, Data, State) ->
     <<EncapData:Length/binary, Rest/binary>> = Data,
     Request = State#state.request,
     State#state{data=Rest,
-                request=Request#icap_request{encap_resphdr = EncapData}};
-set_encap_data(body_wait, Length, Data, State) ->
-    <<EncapData:Length/binary, Rest/binary>> = Data,
-    Request = State#state.request,
-    State#state{data=Rest,
-                request=Request#icap_request{encap_body = EncapData}}.
+                request=Request#icap_request{encap_resphdr = EncapData}}.
     
 %% @private
 parse_encap_offset(Data) ->
@@ -366,7 +406,7 @@ parse_encap(<<"res-body=",Remaining/binary>>, List) ->
     parse_encap(Rest, [{body_wait, BodyO} | List]);
 parse_encap(<<"null-body=", Remaining/binary>>, List) ->
     {BodyO, Rest} = parse_encap_offset(Remaining),
-    parse_encap(Rest, [{null_body, BodyO} | List]);
+    parse_encap(Rest, [{request_complete, BodyO} | List]);
 parse_encap(<<>>, List) ->
     lists:reverse(List);
 parse_encap(Junk, _) ->
