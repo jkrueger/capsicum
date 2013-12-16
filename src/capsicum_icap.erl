@@ -623,10 +623,10 @@ encapsulate(HeaderTag, NullBodyTag, BodyTag, Header, Body) ->
 chunks_to_iolist(Chunks) when is_list(Chunks)->
     lists:foldr(
       fun({Length, Chunk}, Acc) ->
-              [[integer_to_binary(Length, 16), ?CRLF, Chunk] | Acc]
+              [integer_to_binary(Length, 16), ?CRLF, Chunk, ?CRLF | Acc]
       end,
       [<<"0">>, ?CRLF, ?CRLF],
       Chunks);
 chunks_to_iolist(Chunks) when is_binary(Chunks) ->
     Length = byte_size(Chunks),
-    [integer_to_binary(Length, 16), ?CRLF, Chunks, <<"0">>, ?CRLF, ?CRLF].
+    [integer_to_binary(Length, 16), ?CRLF, Chunks, ?CRLF, <<"0">>, ?CRLF, ?CRLF].
