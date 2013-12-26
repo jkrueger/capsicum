@@ -269,7 +269,11 @@ read(body_wait, Incoming, State0) ->
     debug("-> body_wait..."),
     {Needs, State1} =
         case State0#state.encap_elements of
-            [] -> 
+            V when is_number(V) -> 
+                Buffered = State0#state.data,
+                Data     = <<Buffered/binary, Incoming/binary>>,
+                {V, State0#state{data=Data}};
+            _ -> 
                 %% chunk starts
                 case read_line(Incoming, State0) of
                     {NState, Line} ->
@@ -286,11 +290,7 @@ read(body_wait, Incoming, State0) ->
                         {V, NState#state{encap_elements=V}};
                     NState ->
                         {9999999999, NState}
-                end;
-            V  -> 
-                Buffered = State0#state.data,
-                Data     = <<Buffered/binary, Incoming/binary>>,
-                {V, State0#state{data=Data}}
+                end
         end,
     CurrentData = State1#state.data,
     Available = byte_size(CurrentData),
@@ -362,7 +362,7 @@ read_encap_element([{ProtocolState, Offset} | Remaining], Incoming, State) ->
             NewState  = NewState0#state{data=ToBuffer,
                                         protocol_state = NextProtocolState,
                                         encap_offset   = NextOffset,
-                                        encap_elements = Rest},
+                                        encap_elements = Remaining},
             read(NextProtocolState, <<>>, NewState)
     end;
 read_encap_element([], Incoming, State) ->
