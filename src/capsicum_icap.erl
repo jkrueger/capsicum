@@ -518,7 +518,7 @@ respond(Socket, Transport, Type, Opts, State) ->
             Route = lists:keyfind(Path, 1, Routes),
             respond(Socket, Transport, Type, Route, Opts, State)
     end.
-           
+
 respond(Socket, Transport, _Type, false, _Opts, _State) ->
     send_response(not_found, Socket, Transport);
 respond(Socket, Transport, options, {_, _, _, Method}, Opts, State)
@@ -601,6 +601,14 @@ encapsulate(Response) when is_record(Response, http_premade_request) ->
                 <<"null-body=">>,
                 <<"req-body=">>, 
                 Header, 
+                Body);
+encapsulate(Response) when is_record(Response, http_premade_response) ->
+    Header            = Response#http_premade_response.header,
+    Body              = chunks_to_iolist(Response#http_premade_response.body),
+    encapsulate(<<"res-hdr=0, ">>, 
+                <<"null-body=">>,
+                <<"res-body=">>, 
+                Header,
                 Body).
 
 %% @private

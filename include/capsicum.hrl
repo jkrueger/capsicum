@@ -41,4 +41,7 @@
 -record(http_premade_request, {header::binary(),
                                body::binary()}).
 
+-record(http_premade_response, {header::binary(),
+                                body::binary()}).
+
 -type http_premade_request()::#http_premade_request{}.
