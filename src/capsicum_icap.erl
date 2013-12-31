@@ -346,7 +346,7 @@ read_encap_element([{ProtocolState, Offset} | Remaining], Incoming, State) ->
     Available = byte_size(Data),
     Offset    = State#state.encap_offset,
 
-    [{NextProtocolState, NextOffset} | Rest] = Remaining,
+    [{NextProtocolState, NextOffset} | _] = Remaining,
 
     Needs = NextOffset-Offset,
 
@@ -534,13 +534,17 @@ respond(Socket, Transport, options, {_, _, _, Method}, Opts, State)
     send_response(ok, Headers, Socket, Transport);
 respond(Socket, Transport, _, {_, Module, Handler, _}, Opts, State) ->
     case Module:Handler(State#state.request, Opts) of
-        {Code, Response} ->
+        {Code, IcapHeaders} ->
+            send_response(Code, IcapHeaders, Socket, Transport);
+        {Code, IcapHeaders, Response} ->
             {EncapHeader, Body} = encapsulate(Response),
-            Headers = [{<<"ISTag">>,   State#state.istag} | 
-                       EncapHeader],
+            Headers = [{<<"ISTag">>,   State#state.istag} |
+                       [EncapHeader | IcapHeaders]],
             send_response(Code, Headers, Body, Socket, Transport);
-        Code when is_atom(Code)   -> send_response(Code, Socket, Transport);
-        Code when is_number(Code) -> send_response(Code, Socket, Transport)
+        Code when is_atom(Code)   -> 
+            send_response(Code, Socket, Transport);
+        Code when is_number(Code) ->
+            send_response(Code, Socket, Transport)
     end;
 respond(_, _, _, BadRoute, _, _) ->
     throw({server_error, BadRoute}).
@@ -624,7 +628,7 @@ encapsulate(HeaderTag, NullBodyTag, BodyTag, Header, Body) ->
     Encapsulation = <<HeaderTag/binary,
                       BodyEncapTag/binary, 
                       EncapHeaderLenStr/binary>>,
-    {[{<<"Encapsulated">>, Encapsulation}],
+    {{<<"Encapsulated">>, Encapsulation},
      [Header, Body]}.
 
 %% @private
