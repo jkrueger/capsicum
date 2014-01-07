@@ -69,7 +69,9 @@ start(Ref, Socket, Transport, Opts) ->
         loop(Socket, Transport, Timeout, Opts, #state{istag=ISTag})
     catch
         {Type, Description} ->
-            EError= {error, {Type, Description, erlang:get_stacktrace()}},
+            Trace  = erlang:get_stacktrace(),
+            EError = {error, {Type, Description, Trace}},
+            debug("~p error: ~p ~n ~p", [Type, Description, Trace]),
             send_response(Type, Socket, Transport),
             throw(EError);
         _Exception:Reason ->
@@ -80,14 +82,14 @@ start(Ref, Socket, Transport, Opts) ->
 
 -ifdef(DEBUG).
 maybe_log(Data, State) ->
-    Logged=State#state.logged,
+    Logged  = State#state.logged,
     NLogged = <<Logged/binary, Data/binary>>,
     State#state{logged=NLogged}.
 
 debug(Format, Args) ->
-    io:format(Format, Args).
+    lager:info(Format, Args).
 debug(Format) ->
-    io:format(Format).
+    lager:info(Format).
 -else.
 
 %% @private
@@ -112,8 +114,7 @@ loop(Socket, Transport, Timeout, Opts, State0) ->
                true ->
                     RequestType = NewState#state.request#icap_request.type,
                     respond(Socket, Transport, RequestType, Opts, NewState)
-            end;
-        
+            end;        
         Error ->
             if State0#state.errored ->
                     debug("Timing out errored connection: ~n~s~n~p~n",
@@ -279,7 +280,16 @@ read(body_wait, Incoming, State0) ->
                     {NState, Line} ->
                         debug("~p chunk starts...", [Line]),
                         SizeLength = byte_size(Line)-1, % chop off trailing \r
-                        ChunkSize  = <<Line:SizeLength/binary>>,
+                        ChunkSize = 
+                            try 
+                                <<Line:SizeLength/binary>>
+                            catch
+                                S   -> S;
+                                _:_ -> 
+                                    debug("bad chunk starts ~p~nData:~p~n",
+                                          [Incoming, NState#state.logged]),
+                                    throw({bad_request, Line})
+                            end,
                         %% + 2 to account for last CRLF which is not strictly
                         %% part of the chunk, unless it is a zero chunk in which
                         %% case.. well.. there is no CRLF of course.
