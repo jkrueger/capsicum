@@ -113,7 +113,16 @@ loop(Socket, Transport, Timeout, Opts, State0) ->
                     loop(Socket, Transport, Timeout, Opts, NewState);
                true ->
                     RequestType = NewState#state.request#icap_request.type,
-                    respond(Socket, Transport, RequestType, Opts, NewState)
+                    case respond(Socket, 
+                                 Transport, 
+                                 RequestType,
+                                 Opts, 
+                                 NewState) of 
+                        {ok, continue} ->
+                            loop(Socket, Transport, Timeout, Opts, NewState);
+                        true -> 
+                            ok
+                    end
             end;        
         Error ->
             if State0#state.errored ->
@@ -537,10 +546,16 @@ respond(Socket, Transport, options, {_, _, _, Method}, Opts, State)
     Acceptors    = etbx:to_binary(etbx:to_string(NumAcceptors)),
     
     Date      = httpd_util:rfc1123_date(),
-    Headers   = [{<<"Methods">>, Method},
+    Headers0  = [{<<"Methods">>, Method},
                  {<<"ISTag">>,   State#state.istag},
                  {<<"Date">>,    etbx:to_binary(Date)},
                  {<<"Max-Connections">>, Acceptors}],
+    Preview   = proplists:get_value(preview, Opts),
+    Headers   = if Preview =:= undefined ->
+                        Headers0;
+                   true ->
+                        {<<"Preview">>, Preview}
+                end,
     send_response(ok, Headers, Socket, Transport);
 respond(Socket, Transport, _, {_, Module, Handler, _}, Opts, State) ->
     case Module:Handler(State#state.request, Opts) of
@@ -568,8 +583,10 @@ send_response(Code, Headers0, Socket, Transport) ->
     Headers = [{<<"Encapsulated">>, <<"null-body=0">>} | Headers0],
     send_response(Code, Headers, <<>>, Socket, Transport).
 
+send_response(Code, Headers, Body, Socket, Transport) ->
+    send_response(Code, response_status(Code), Headers, Body, Socket, Transport).
 
-send_response(Status, Headers, Body, Socket, Transport) 
+send_response(Code, Status, Headers, Body, Socket, Transport) 
   when is_binary(Status) ->
     HeaderLines = encode_headers(?VERSION, Status, Headers),
     Response = [HeaderLines, Body],
@@ -578,10 +595,9 @@ send_response(Status, Headers, Body, Socket, Transport)
         {error, Reason} ->
             debug("connection closed by client"),
             {error, Reason};
-        ok -> ok
-    end;
-send_response(Code, Headers, Body, Socket, Transport) ->
-    send_response(response_status(Code), Headers, Body, Socket, Transport).
+        ok ->
+            {ok, Code}
+    end.
 
 %% @private
 encode_headers(Version, Status, Headers) ->
