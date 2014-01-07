@@ -120,8 +120,7 @@ loop(Socket, Transport, Timeout, Opts, State0) ->
                                  NewState) of 
                         {ok, continue} ->
                             loop(Socket, Transport, Timeout, Opts, NewState);
-                        true -> 
-                            ok
+                        Else -> Else
                     end
             end;        
         Error ->
