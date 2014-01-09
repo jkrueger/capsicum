@@ -553,7 +553,10 @@ respond(Socket, Transport, options, {_, _, _, Method}, Opts, State)
     Headers   = if Preview =:= undefined ->
                         Headers0;
                    true ->
-                        {<<"Preview">>, Preview}
+                        lists:append(
+                          Headers0,
+                          [{<<"Preview">>, Preview},
+                           {<<"Transfer-Preview">>, <<"*">>}])
                 end,
     send_response(ok, Headers, Socket, Transport);
 respond(Socket, Transport, _, {_, Module, Handler, _}, Opts, State) ->
